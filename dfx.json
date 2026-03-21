@@ -21,7 +21,7 @@
   "defaults": {
     "build": {
       "args": "",
-      "packtool": "mops sources"
+      "packtool": "./scripts/mops-packtool.sh"
     }
   },
   "output_env_file": ".env",

@@ -1,0 +1,18 @@
+[package]
+name = "http-parser"
+version = "0.4.1"
+description = "A http request parser for parsing url, search query, headers and form data."
+repository = "https://github.com/NatLabs/http-parser.mo"
+
+[dependencies]
+base = "0.14.13"
+hex = "1.0.1"
+'base@0.7.3' = '0.7.3'
+
+[dev-dependencies]
+bench = "1.0.0"
+test = "2.1.1"
+
+[toolchain]
+moc = "0.14.13"
+wasmtime = "15.0.0"

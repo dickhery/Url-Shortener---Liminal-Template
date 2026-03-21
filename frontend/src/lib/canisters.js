@@ -1,15 +1,31 @@
-import { createActor, canisterId } from 'declarations/backend';
 import { building } from '$app/environment';
 
-function dummyActor() {
-    return new Proxy({}, { get() { throw new Error("Canister invoked while building"); } });
-}
+const readCanisterId = () => {
+  const configuredCanisterId =
+    process.env.CANISTER_ID_BACKEND ??
+    process.env.CANISTER_ID ??
+    process.env.BACKEND_CANISTER_ID;
 
-const buildingOrTesting = building || process.env.NODE_ENV === "test";
+  if (configuredCanisterId) {
+    return configuredCanisterId;
+  }
 
-export const backend = buildingOrTesting
-    ? dummyActor()
-    : createActor(canisterId);
+  if (building || process.env.NODE_ENV === 'test') {
+    return 'backend';
+  }
 
-// Export canisterId for use in other modules
-export { canisterId };
+  throw new Error(
+    'Missing backend canister id. Run `dfx deploy` (or `dfx generate backend`) so DFX can populate the CANISTER_ID_BACKEND environment variable.'
+  );
+};
+
+export const canisterId = readCanisterId();
+
+export const backend = new Proxy(
+  {},
+  {
+    get() {
+      throw new Error('This app talks to the backend over HTTP. Use UrlApi instead of a generated actor.');
+    },
+  }
+);

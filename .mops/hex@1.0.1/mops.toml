@@ -1,0 +1,10 @@
+[package]
+name = "hex"
+version = "1.0.1"
+description = "Convert between Nat8 values/arrays and hexadecimal string representation"
+repository = "https://github.com/f0i/hex"
+keywords = [ "hex", "encoding", "decoding", "utils", "bytes" ]
+license = "MIT"
+
+[dependencies]
+core = "0.6.0"

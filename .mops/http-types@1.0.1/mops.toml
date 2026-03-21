@@ -1,0 +1,10 @@
+[package]
+name = "http-types"
+version = "1.0.1"
+description = "Canister HTTP interface types used in `http_request` and `http_request_update`"
+repository = "https://github.com/ZenVoich/http-types"
+keywords = [ "types", "interface", "http", "https" ]
+license = "MIT"
+
+[toolchain]
+moc = "0.10.3"

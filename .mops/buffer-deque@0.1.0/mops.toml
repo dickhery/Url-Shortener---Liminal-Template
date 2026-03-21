@@ -1,0 +1,12 @@
+[package]
+name = "buffer-deque"
+version = "0.1.0"
+description = "A Buffer with the functionality of a Deque for efficient insertion and deletion at both ends."
+repository = "https://github.com/NatLabs/BufferDeque"
+keywords = [ "buffer", "deque", "queue", "ring", "circular" ]
+
+[dependencies]
+base = "0.8.1"
+
+[dev-dependencies]
+test = "1.0.1"

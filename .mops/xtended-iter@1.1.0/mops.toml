@@ -1,0 +1,13 @@
+[package]
+name = "xtended-iter"
+version = "1.1.0"
+description = "A library to extend the functionality of the base Iter"
+repository = "https://github.com/edjCase/motoko_iter"
+keywords = ["iter", "iterator", "array"]
+license = "MIT"
+
+[dependencies]
+"core@1" = "1.0.0"
+
+[dev-dependencies]
+test = "2.1.1"

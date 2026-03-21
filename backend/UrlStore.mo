@@ -2,12 +2,10 @@ import Array "mo:core@1/Array";
 import Map "mo:core@1/Map";
 import Iter "mo:core@1/Iter";
 import Nat "mo:core@1/Nat";
-import Nat32 "mo:core@1/Nat32";
 import Result "mo:core@1/Result";
 import Text "mo:core@1/Text";
 import Time "mo:core@1/Time";
-import Int "mo:core@1/Int";
-import Random "mo:core@1/Random";
+import Principal "mo:core@1/Principal";
 import Char "mo:core@1/Char";
 import BTree "mo:stableheapbtreemap/BTree";
 import Debug "mo:core@1/Debug";
@@ -18,25 +16,36 @@ module {
     nextId : Nat;
   };
 
+  public type UrlMetadata = {
+    title : ?Text;
+    description : ?Text;
+    imageUrl : ?Text;
+    canonicalUrl : ?Text;
+    siteName : ?Text;
+  };
+
   public type Url = {
     id : Nat;
     originalUrl : Text;
     shortCode : Text;
     clicks : Nat;
     createdAt : Int;
+    owner : Principal;
+    metadata : ?UrlMetadata;
   };
 
-  public type CreateRequest = {
-    originalUrl : Text;
-    customSlug : ?Text;
-  };
-
-  public type UrlStats = {
+  public type UrlView = {
     id : Nat;
     originalUrl : Text;
     shortCode : Text;
     clicks : Nat;
     createdAt : Int;
+    metadata : ?UrlMetadata;
+  };
+
+  public type CreateRequest = {
+    originalUrl : Text;
+    customSlug : ?Text;
   };
 
   public class Store(stableData : StableData) = self {
@@ -60,12 +69,32 @@ module {
       |> Iter.toArray(_);
     };
 
+    public func getUrlsByOwner(owner : Principal) : [UrlView] {
+      BTree.entries(stableData.urls)
+      |> Iter.map(
+        _,
+        func((_, url) : (Nat, Url)) : ?UrlView {
+          if (Principal.equal(url.owner, owner)) {
+            ?toView(url);
+          } else {
+            null;
+          };
+        },
+      )
+      |> Iter.filterMap(_, func(url : ?UrlView) : ?UrlView = url)
+      |> Iter.toArray(_);
+    };
+
     public func getUrlByShortCode(shortCode : Text) : ?Url {
       let ?id = Map.get(slugToIdMap, Text.compare, shortCode) else return null;
       BTree.get(stableData.urls, Nat.compare, id);
     };
 
-    public func incrementClicks(shortCode : Text) : ?Text {
+    public func getUrlById(id : Nat) : ?Url {
+      BTree.get(stableData.urls, Nat.compare, id);
+    };
+
+    public func incrementClicks(shortCode : Text) : ?Url {
       let ?url = getUrlByShortCode(shortCode) else return null;
 
       Debug.print("Incrementing clicks for shortCode: " # shortCode # " (ID: " # Nat.toText(url.id) # "), current clicks: " # Nat.toText(url.clicks));
@@ -76,17 +105,15 @@ module {
       };
 
       ignore BTree.insert(stableData.urls, Nat.compare, url.id, updatedUrl);
-      ?url.originalUrl;
+      ?updatedUrl;
     };
 
-    public func create(request : CreateRequest) : Result.Result<Url, Text> {
-      // Validate original URL
+    public func validateCreateRequest(request : CreateRequest) : Result.Result<(), Text> {
       if (not isValidUrl(request.originalUrl)) {
         return #err("Invalid URL format: " # request.originalUrl);
       };
 
-      // Generate or validate short code
-      let shortCode = switch (request.customSlug) {
+      switch (request.customSlug) {
         case (?slug) {
           if (not isValidSlug(slug)) {
             return #err("Invalid custom slug. Use only letters, numbers, hyphens, and underscores");
@@ -94,8 +121,21 @@ module {
           if (Map.get(slugToIdMap, Text.compare, slug) != null) {
             return #err("Custom slug already exists");
           };
-          slug;
         };
+        case null {};
+      };
+
+      #ok(());
+    };
+
+    public func create(request : CreateRequest, owner : Principal, metadata : ?UrlMetadata) : Result.Result<Url, Text> {
+      switch (validateCreateRequest(request)) {
+        case (#err(message)) return #err(message);
+        case (#ok(())) {};
+      };
+
+      let shortCode = switch (request.customSlug) {
+        case (?slug) { slug };
         case null {
           generateShortCode();
         };
@@ -107,6 +147,8 @@ module {
         shortCode = shortCode;
         clicks = 0;
         createdAt = Time.now();
+        owner = owner;
+        metadata = metadata;
       };
 
       nextId += 1;
@@ -116,10 +158,81 @@ module {
       #ok(newUrl);
     };
 
-    public func delete(id : Nat) : Bool {
-      let ?url = BTree.delete(stableData.urls, Nat.compare, id) else return false;
+    public func delete(id : Nat, caller : Principal) : Result.Result<(), Text> {
+      let ?url = BTree.get(stableData.urls, Nat.compare, id) else return #err("URL not found");
+
+      if (not Principal.equal(url.owner, caller)) {
+        return #err("You can only delete URLs you created");
+      };
+
+      ignore BTree.delete(stableData.urls, Nat.compare, id);
       ignore Map.delete(slugToIdMap, Text.compare, url.shortCode);
-      true;
+      #ok(());
+    };
+
+    public func updateMetadata(id : Nat, caller : Principal, metadata : ?UrlMetadata) : Result.Result<Url, Text> {
+      let ?url = getUrlById(id) else return #err("URL not found");
+
+      if (not Principal.equal(url.owner, caller)) {
+        return #err("You can only refresh URLs you created");
+      };
+
+      replaceMetadata(id, metadata);
+    };
+
+    public func replaceMetadata(id : Nat, metadata : ?UrlMetadata) : Result.Result<Url, Text> {
+      let ?url = getUrlById(id) else return #err("URL not found");
+
+      let updatedUrl : Url = {
+        url with
+        metadata = metadata;
+      };
+
+      ignore BTree.insert(stableData.urls, Nat.compare, id, updatedUrl);
+      #ok(updatedUrl);
+    };
+
+    public func getUrlsMissingMetadataByOwner(owner : Principal) : [Url] {
+      BTree.entries(stableData.urls)
+      |> Iter.map(
+        _,
+        func((_, url) : (Nat, Url)) : ?Url {
+          if (Principal.equal(url.owner, owner) and isMetadataMissing(url.metadata)) {
+            ?url;
+          } else {
+            null;
+          };
+        },
+      )
+      |> Iter.filterMap(_, func(url : ?Url) : ?Url = url)
+      |> Iter.toArray(_);
+    };
+
+    public func getUrlsMissingMetadata() : [Url] {
+      BTree.entries(stableData.urls)
+      |> Iter.map(
+        _,
+        func((_, url) : (Nat, Url)) : ?Url {
+          if (isMetadataMissing(url.metadata)) {
+            ?url;
+          } else {
+            null;
+          };
+        },
+      )
+      |> Iter.filterMap(_, func(url : ?Url) : ?Url = url)
+      |> Iter.toArray(_);
+    };
+
+    public func toView(url : Url) : UrlView {
+      {
+        id = url.id;
+        originalUrl = url.originalUrl;
+        shortCode = url.shortCode;
+        clicks = url.clicks;
+        createdAt = url.createdAt;
+        metadata = url.metadata;
+      };
     };
 
     public func toStableData() : StableData {
@@ -129,10 +242,7 @@ module {
       };
     };
 
-    // Private helper functions
-
     private func isValidUrl(url : Text) : Bool {
-      // Basic URL validation - must start with http:// or https://
       Text.startsWith(url, #text("http://")) or Text.startsWith(url, #text("https://"));
     };
 
@@ -151,9 +261,6 @@ module {
       let charsArray = chars.chars() |> Iter.toArray(_);
       let length = 6;
       var code = "";
-
-      // Simple deterministic generation based on nextId for now
-      // In production, you'd want a proper random generator
       let base = nextId;
       var num = base;
 
@@ -163,11 +270,30 @@ module {
         num := num / charsArray.size() + 1;
       };
 
-      // Ensure uniqueness
       if (Map.get(slugToIdMap, Text.compare, code) != null) {
-        code # Nat.toText(nextId); // Add ID as suffix if collision
+        code # Nat.toText(nextId);
       } else {
         code;
+      };
+    };
+
+    private func isMetadataMissing(metadata : ?UrlMetadata) : Bool {
+      switch (metadata) {
+        case null true;
+        case (?value) {
+          not isNonEmptyText(value.title) and
+          not isNonEmptyText(value.description) and
+          not isNonEmptyText(value.imageUrl) and
+          not isNonEmptyText(value.canonicalUrl) and
+          not isNonEmptyText(value.siteName);
+        };
+      };
+    };
+
+    private func isNonEmptyText(value : ?Text) : Bool {
+      switch (value) {
+        case (?text) text != "";
+        case null false;
       };
     };
   };
