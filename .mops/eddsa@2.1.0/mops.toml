@@ -1,0 +1,30 @@
+[package]
+name = "eddsa"
+version = "2.1.0"
+description = "A library for EdDSA public keys/signatures in Motoko"
+repository = "https://github.com/edjcase/motoko_eddsa"
+keywords = [
+  "eddsa",
+  "signature",
+  "verify",
+  "key",
+  "public",
+  "private",
+  "curve",
+  "cryptography",
+]
+license = "MIT"
+
+[dependencies]
+"core@1" = "1.0.0"
+"base-x-encoder@2" = "2.1.0"
+"asn1@3" = "3.1.0"
+"sha2@0" = "0.1.6"
+"tweetnacl@1" = "1.1.2"
+"buffer@0" = "0.1.0"
+"xtended-iter@1" = "1.1.0"
+"xtended-numbers@2" = "2.1.0"
+
+[dev-dependencies]
+test = "2.1.1"
+bench = "1.0.0"

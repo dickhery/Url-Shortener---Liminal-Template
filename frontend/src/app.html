@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width" />
+	<title>Tiny ICP | Prepaid URL Shortener</title>
+	<meta
+		name="description"
+		content="Create prepaid short URLs on TinyICP.com with tracked clicks, wallet funding, and instant top-ups on the Internet Computer."
+	/>
+	<meta name="theme-color" content="#000000" />
+	<meta name="application-name" content="Tiny ICP" />
+	<link rel="canonical" href="https://tinyicp.com/" />
+	<link rel="icon" type="image/png" sizes="1024x1024" href="/favicon.png" />
+	<link rel="apple-touch-icon" href="/favicon.png" />
+	<meta property="og:type" content="website" />
+	<meta property="og:title" content="Tiny ICP | Prepaid URL Shortener" />
+	<meta
+		property="og:description"
+		content="Create prepaid short URLs on TinyICP.com with tracked clicks, wallet funding, and instant top-ups on the Internet Computer."
+	/>
+	<meta property="og:url" content="https://tinyicp.com/" />
+	<meta property="og:site_name" content="Tiny ICP" />
+	<meta property="og:image" content="https://tinyicp.com/og-preview.png" />
+	<meta property="og:image:secure_url" content="https://tinyicp.com/og-preview.png" />
+	<meta property="og:image:type" content="image/png" />
+	<meta property="og:image:width" content="1200" />
+	<meta property="og:image:height" content="630" />
+	<meta
+		property="og:image:alt"
+		content="Tiny ICP link preview card showing the Tiny ICP name, URL, and prepaid URL shortener messaging."
+	/>
+	<meta name="twitter:card" content="summary_large_image" />
+	<meta name="twitter:title" content="Tiny ICP | Prepaid URL Shortener" />
+	<meta
+		name="twitter:description"
+		content="Create prepaid short URLs on TinyICP.com with tracked clicks, wallet funding, and instant top-ups on the Internet Computer."
+	/>
+	<meta name="twitter:image" content="https://tinyicp.com/og-preview.png" />
+	<meta
+		name="twitter:image:alt"
+		content="Tiny ICP link preview card showing the Tiny ICP name, URL, and prepaid URL shortener messaging."
+	/>
+	<style>
+		:root {
+			color-scheme: dark;
+		}
+
+		html,
+		body {
+			margin: 0;
+			min-height: 100%;
+			background: #020504;
+		}
+
+		body {
+			background:
+				radial-gradient(circle at top, rgba(0, 255, 156, 0.12), transparent 38%),
+				linear-gradient(180deg, #05110d 0%, #020504 55%, #000 100%);
+		}
+
+		html.tinyicp-booting body,
+		html.short-link-loading body {
+			overflow: hidden;
+		}
+
+		#boot-loading-shell,
+		#redirect-loading-shell {
+			position: fixed;
+			inset: 0;
+			display: none;
+			align-items: center;
+			justify-content: center;
+			padding: 24px;
+			box-sizing: border-box;
+			overflow: hidden;
+			background:
+				radial-gradient(circle at top, rgba(0, 255, 156, 0.12), transparent 32%),
+				linear-gradient(180deg, rgba(0, 0, 0, 0.98) 0%, rgba(2, 10, 8, 0.99) 48%, rgba(0, 0, 0, 0.99) 100%);
+			color: #d7fff0;
+			font-family: "Courier New", Monaco, monospace;
+			transition: opacity 0.28s ease, visibility 0.28s ease;
+			opacity: 1;
+			visibility: visible;
+			z-index: 3000;
+		}
+
+		html.tinyicp-booting #boot-loading-shell,
+		html.short-link-loading #redirect-loading-shell {
+			display: flex;
+		}
+
+		#boot-loading-shell.hidden,
+		#redirect-loading-shell.hidden {
+			opacity: 0;
+			visibility: hidden;
+			pointer-events: none;
+		}
+
+		#boot-loading-shell::before,
+		#redirect-loading-shell::before,
+		#boot-loading-shell::after,
+		#redirect-loading-shell::after,
+		.boot-noscript-shell::before,
+		.boot-noscript-shell::after {
+			content: "";
+			position: absolute;
+			inset: 0;
+			pointer-events: none;
+		}
+
+		#boot-loading-shell::before,
+		#redirect-loading-shell::before,
+		.boot-noscript-shell::before {
+			background-image:
+				linear-gradient(rgba(0, 255, 156, 0.08) 1px, transparent 1px),
+				linear-gradient(90deg, rgba(0, 255, 156, 0.05) 1px, transparent 1px);
+			background-size: 100% 30px, 30px 100%;
+			opacity: 0.22;
+		}
+
+		#boot-loading-shell::after,
+		#redirect-loading-shell::after,
+		.boot-noscript-shell::after {
+			background: linear-gradient(
+				180deg,
+				transparent 0%,
+				rgba(255, 255, 255, 0.02) 48%,
+				rgba(0, 255, 156, 0.1) 50%,
+				transparent 52%,
+				transparent 100%
+			);
+			animation: tinyicp-scanline 7s linear infinite;
+			opacity: 0.45;
+		}
+
+		.loading-panel {
+			position: relative;
+			width: min(680px, 100%);
+			border: 2px solid #00ff9c;
+			padding: 32px;
+			background:
+				radial-gradient(circle at top, rgba(0, 255, 156, 0.09), transparent 48%),
+				rgba(0, 0, 0, 0.9);
+			box-shadow:
+				0 0 32px rgba(0, 255, 156, 0.16),
+				inset 0 0 0 1px rgba(143, 255, 210, 0.18);
+			z-index: 1;
+		}
+
+		.loading-topline {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			gap: 1rem;
+			flex-wrap: wrap;
+			margin-bottom: 1.5rem;
+		}
+
+		.loading-kicker,
+		.loading-chip {
+			margin: 0;
+			color: #8fffd2;
+			font-size: 0.76rem;
+			letter-spacing: 0.18em;
+			text-transform: uppercase;
+		}
+
+		.loading-chip {
+			padding: 0.35rem 0.7rem;
+			border: 1px solid rgba(143, 255, 210, 0.45);
+			background: rgba(0, 255, 156, 0.08);
+			animation: tinyicp-chip-pulse 1.8s ease-in-out infinite;
+		}
+
+		.loading-panel h1 {
+			margin: 0 0 1rem;
+			font-size: clamp(1.9rem, 4vw, 2.8rem);
+			line-height: 1.1;
+			color: #00ff9c;
+			text-shadow: 0 0 14px rgba(0, 255, 156, 0.18);
+		}
+
+		.loading-description,
+		.loading-note {
+			margin: 0;
+			color: #d7fff0;
+			line-height: 1.6;
+		}
+
+		.loading-meter {
+			margin: 1.5rem 0 1.2rem;
+			padding: 2px;
+			border: 1px solid rgba(143, 255, 210, 0.5);
+			background: rgba(0, 255, 156, 0.06);
+			overflow: hidden;
+		}
+
+		.loading-meter-bar {
+			display: block;
+			height: 12px;
+			width: 34%;
+			background: linear-gradient(90deg, #00ff9c 0%, #b8ffe5 50%, #00ff9c 100%);
+			box-shadow: 0 0 18px rgba(0, 255, 156, 0.45);
+			animation: tinyicp-meter-sweep 1.35s linear infinite;
+		}
+
+		.loading-ledger {
+			display: grid;
+			gap: 0.75rem;
+			margin-top: 1.25rem;
+		}
+
+		.loading-row {
+			display: grid;
+			grid-template-columns: auto 1fr;
+			gap: 0.8rem;
+			align-items: start;
+			padding: 0.8rem 0.95rem;
+			border: 1px dashed rgba(143, 255, 210, 0.35);
+			background: rgba(0, 255, 156, 0.05);
+			min-width: 0;
+		}
+
+		.loading-row-label {
+			color: #00ff9c;
+		}
+
+		.loading-row-value {
+			color: #d7fff0;
+			overflow-wrap: anywhere;
+			word-break: break-word;
+		}
+
+		.loading-note {
+			margin-top: 1.25rem;
+			color: #a9f2cd;
+		}
+
+		.boot-noscript-shell {
+			position: fixed;
+			inset: 0;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			padding: 24px;
+			box-sizing: border-box;
+			overflow: hidden;
+			background:
+				radial-gradient(circle at top, rgba(0, 255, 156, 0.12), transparent 32%),
+				linear-gradient(180deg, rgba(0, 0, 0, 0.98) 0%, rgba(2, 10, 8, 0.99) 48%, rgba(0, 0, 0, 0.99) 100%);
+			color: #d7fff0;
+			font-family: "Courier New", Monaco, monospace;
+			z-index: 3000;
+		}
+
+		@keyframes tinyicp-meter-sweep {
+			0% {
+				transform: translateX(-130%);
+			}
+
+			100% {
+				transform: translateX(320%);
+			}
+		}
+
+		@keyframes tinyicp-chip-pulse {
+			0%,
+			100% {
+				box-shadow: 0 0 0 rgba(0, 255, 156, 0);
+			}
+
+			50% {
+				box-shadow: 0 0 18px rgba(0, 255, 156, 0.16);
+			}
+		}
+
+		@keyframes tinyicp-scanline {
+			0% {
+				transform: translateY(-100%);
+			}
+
+			100% {
+				transform: translateY(100%);
+			}
+		}
+
+		@media (max-width: 640px) {
+			#boot-loading-shell,
+			#redirect-loading-shell,
+			.boot-noscript-shell {
+				padding: 16px;
+			}
+
+			.loading-panel {
+				padding: 24px 20px;
+			}
+
+			.loading-row {
+				grid-template-columns: 1fr;
+			}
+		}
+	</style>
+	<script>
+		const isShortLinkPath = window.location.pathname.startsWith("/s/");
+		const bootStartedAt = Date.now();
+		const minimumBootMs = 650;
+
+		if (isShortLinkPath) {
+			document.documentElement.classList.add("short-link-loading");
+		} else {
+			document.documentElement.classList.add("tinyicp-booting");
+		}
+
+		function hideLoadingShell(shell, htmlClassToRemove) {
+			if (!shell || shell.dataset.state === "hidden") {
+				return;
+			}
+
+			shell.dataset.state = "hidden";
+			shell.classList.add("hidden");
+			shell.setAttribute("aria-hidden", "true");
+			window.setTimeout(() => {
+				document.documentElement.classList.remove(htmlClassToRemove);
+				shell.remove();
+			}, 320);
+		}
+
+		if (isShortLinkPath) {
+			window.addEventListener("DOMContentLoaded", () => {
+				const shell = document.getElementById("redirect-loading-shell");
+				const pathTarget = document.getElementById("redirect-loading-path");
+				if (pathTarget) {
+					pathTarget.textContent = `tinyicp.com${window.location.pathname}`;
+				}
+				if (shell) {
+					shell.setAttribute("aria-hidden", "false");
+				}
+			});
+		} else {
+			window.addEventListener("DOMContentLoaded", () => {
+				const shell = document.getElementById("boot-loading-shell");
+				if (!shell) {
+					return;
+				}
+
+				shell.setAttribute("aria-hidden", "false");
+				let revealed = false;
+
+				const revealApp = () => {
+					if (revealed) {
+						return;
+					}
+
+					revealed = true;
+					const elapsed = Date.now() - bootStartedAt;
+					const remainingDelay = Math.max(0, minimumBootMs - elapsed);
+
+					window.setTimeout(() => {
+						hideLoadingShell(shell, "tinyicp-booting");
+					}, remainingDelay);
+				};
+
+				if (document.querySelector("main")) {
+					window.requestAnimationFrame(() => {
+						window.requestAnimationFrame(revealApp);
+					});
+					return;
+				}
+
+				const observer = new MutationObserver(() => {
+					if (document.querySelector("main")) {
+						observer.disconnect();
+						revealApp();
+					}
+				});
+
+				observer.observe(document.body, { childList: true, subtree: true });
+				window.addEventListener(
+					"load",
+					() => {
+						observer.disconnect();
+						revealApp();
+					},
+					{ once: true }
+				);
+			});
+		}
+	</script>
+	%sveltekit.head%
+</head>
+
+<body data-sveltekit-preload-data="hover">
+	<div id="boot-loading-shell" aria-hidden="true">
+		<div class="loading-panel" role="status" aria-live="polite">
+			<div class="loading-topline">
+				<p class="loading-kicker">TinyICP // Boot Sequence</p>
+				<p class="loading-chip">Loading Dashboard</p>
+			</div>
+			<h1>Spinning up your prepaid link console</h1>
+			<p class="loading-description">
+				Warming the wallet dashboard, checking your Internet Identity session, and syncing
+				TinyICP route data.
+			</p>
+			<div class="loading-meter" aria-hidden="true">
+				<span class="loading-meter-bar"></span>
+			</div>
+			<div class="loading-ledger">
+				<div class="loading-row">
+					<span class="loading-row-label">[01]</span>
+					<span class="loading-row-value">Initializing TinyICP terminal frame</span>
+				</div>
+				<div class="loading-row">
+					<span class="loading-row-label">[02]</span>
+					<span class="loading-row-value">Checking wallet-aware dashboard state</span>
+				</div>
+				<div class="loading-row">
+					<span class="loading-row-label">[03]</span>
+					<span class="loading-row-value">Preparing your short-link control panel</span>
+				</div>
+			</div>
+			<p class="loading-note">One quick moment while the TinyICP interface comes online.</p>
+		</div>
+	</div>
+	<div id="redirect-loading-shell">
+		<div class="loading-panel" role="status" aria-live="polite">
+			<div class="loading-topline">
+				<p class="loading-kicker">TinyICP // Redirect Relay</p>
+				<p class="loading-chip">Resolving Short Link</p>
+			</div>
+			<h1>Routing you to the original URL</h1>
+			<p class="loading-description">
+				Verifying the prepaid short link and preparing the saved destination.
+			</p>
+			<div class="loading-meter" aria-hidden="true">
+				<span class="loading-meter-bar"></span>
+			</div>
+			<div class="loading-ledger">
+				<div class="loading-row">
+					<span class="loading-row-label">[PATH]</span>
+					<span id="redirect-loading-path" class="loading-row-value">tinyicp.com</span>
+				</div>
+				<div class="loading-row">
+					<span class="loading-row-label">[NEXT]</span>
+					<span class="loading-row-value">Opening the destination in a fresh page context</span>
+				</div>
+			</div>
+			<p class="loading-note">If the redirect takes longer than expected, try one refresh.</p>
+		</div>
+	</div>
+	<noscript>
+		<div class="boot-noscript-shell">
+			<div class="loading-panel">
+				<div class="loading-topline">
+					<p class="loading-kicker">TinyICP // Manual Mode</p>
+					<p class="loading-chip">JavaScript Required</p>
+				</div>
+				<h1>TinyICP needs JavaScript enabled</h1>
+				<p class="loading-description">
+					Enable JavaScript to open the dashboard, authenticate with Internet Identity, and
+					follow TinyICP short-link redirects.
+				</p>
+			</div>
+		</div>
+	</noscript>
+	<div style="display: contents">%sveltekit.body%</div>
+</body>
+
+</html>
