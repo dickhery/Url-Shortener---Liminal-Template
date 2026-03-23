@@ -43,6 +43,7 @@ export const login = async () => {
   return new Promise((resolve, reject) => {
     client.login({
       identityProvider: getIdentityProvider(),
+      derivationOrigin: "https://srbli-5iaaa-aaaab-aga5q-cai.icp0.io",
       onSuccess: resolve,
       onError: reject,
       windowOpenerFeatures: 'toolbar=0,location=0,menubar=0,width=520,height=705,left=100,top=100'

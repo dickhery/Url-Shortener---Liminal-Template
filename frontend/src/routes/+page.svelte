@@ -2,7 +2,6 @@
     import "../index.scss";
     import { onMount } from "svelte";
     import UrlApi, { formatIcp } from "$lib/urlApi.js";
-    import { canisterId } from "$lib/canisters.js";
     import {
         getPrincipalText,
         isAuthenticated,
@@ -27,31 +26,34 @@
     let copiedWalletValue = "";
     let showPurchaseModal = false;
     let pendingRequest = null;
+    let deleteCandidate = null;
     let withdrawalAccountId = "";
     let withdrawalAmountIcp = "";
     let refreshingPreviewIds = [];
+    let purchasedClicks = 10_000;
+    let topUpClicksByUrl = {};
+    let topUpUrlId = null;
+    let autoShortCodePreview = "";
+    let autoShortCodePreviewLoading = false;
+    let autoShortCodePreviewError = "";
+    let customShortCodeStatus = "idle";
+    let customShortCodeMessage = "";
+    let trimmedCustomSlug = "";
+    let isUsingCustomShortCode = false;
+    let shortCodePreviewValue = "";
+    let shortCodePreviewStatus = "idle";
+    let shortCodePreviewMessage = "";
+    let canSubmitShorten = false;
+    const clickRefreshTimers = new Map();
     const customSlugPattern = /^[A-Za-z0-9_-]+$/;
-
-    function getBackendBaseUrl(raw = true) {
-        const canisterIdAndRaw = raw ? `${canisterId}.raw` : canisterId;
-
-        if (typeof window === "undefined") {
-            return `http://${canisterIdAndRaw}.localhost:4943`;
-        }
-
-        const hostname = window.location.hostname;
-        const port = window.location.port || "4943";
-        const isLocal =
-            hostname === "localhost" ||
-            hostname === "127.0.0.1" ||
-            hostname.endsWith(".localhost");
-
-        if (isLocal) {
-            return `http://${canisterIdAndRaw}.localhost:${port}`;
-        }
-
-        return `https://${canisterIdAndRaw}.icp0.io`;
-    }
+    const DEFAULT_CLICK_BUNDLE_SIZE = 10_000;
+    const DEFAULT_CLICK_BUNDLE_PRICE_E8S = 10_000_000;
+    const DEFAULT_MINIMUM_PURCHASE_CLICKS = 10_000;
+    const DEFAULT_LEDGER_FEE_E8S = 10_000;
+    const SHORT_CODE_CHECK_DEBOUNCE_MS = 250;
+    let shortCodeCheckTimer = null;
+    let shortCodeCheckRequestId = 0;
+    let autoShortCodePreviewRequestId = 0;
 
     async function syncAuthState() {
         authLoading = true;
@@ -63,16 +65,22 @@
             principal = authenticated ? await getPrincipalText() : "";
 
             if (authenticated) {
-                await Promise.all([loadUrls(), loadWallet()]);
+                await Promise.all([
+                    loadUrls(),
+                    loadWallet(),
+                    refreshAutoShortCodePreview()
+                ]);
             } else {
                 urls = [];
                 wallet = null;
+                resetShortCodePreviewState();
             }
         } catch (err) {
             authenticated = false;
             principal = "";
             wallet = null;
             walletError = "";
+            resetShortCodePreviewState();
             error = "Failed to initialize authentication: " + err.message;
         } finally {
             authLoading = false;
@@ -139,6 +147,7 @@
             urls = [];
             wallet = null;
             walletError = "";
+            resetShortCodePreviewState();
             showSuccess("Signed out successfully");
         } catch (err) {
             error = "Failed to sign out: " + err.message;
@@ -165,16 +174,61 @@
             return;
         }
 
-        if (customSlug.trim() && !customSlugPattern.test(customSlug.trim())) {
+        const requestedCustomSlug = customSlug.trim();
+        if (requestedCustomSlug && !customSlugPattern.test(requestedCustomSlug)) {
             error =
                 "Custom short codes can use only letters, numbers, hyphens, and underscores.";
             return;
         }
 
+        if (!isValidClickPurchase(purchasedClicks)) {
+            error = `Choose at least ${formatClicks(minimumPurchaseClicks)} prepaid clicks in ${formatClicks(clickBundleSize)}-click increments.`;
+            return;
+        }
+
+        let previewShortCode = "";
+
+        if (requestedCustomSlug) {
+            const isAvailable =
+                customShortCodeStatus === "ready"
+                    ? true
+                    : await updateCustomShortCodeAvailability(requestedCustomSlug);
+
+            if (!isAvailable) {
+                error =
+                    customShortCodeStatus === "taken"
+                        ? "That custom short code is already taken. Choose another one before continuing."
+                        : customShortCodeMessage ||
+                          "We couldn't verify that custom short code right now.";
+                return;
+            }
+
+            try {
+                previewShortCode = await UrlApi.reserveShortCodePreview(
+                    requestedCustomSlug
+                );
+            } catch (err) {
+                error = "Failed to reserve your custom short code preview: " + err.message;
+                return;
+            }
+        } else {
+            previewShortCode =
+                (await refreshAutoShortCodePreview()) || autoShortCodePreview;
+
+            if (!previewShortCode) {
+                error =
+                    autoShortCodePreviewError ||
+                    "Failed to reserve an auto-generated short code preview.";
+                return;
+            }
+        }
+
         error = "";
         pendingRequest = {
             originalUrl: newUrl.trim(),
-            customSlug: customSlug.trim() || null
+            customSlug: requestedCustomSlug || null,
+            previewShortCode,
+            purchasedClicks
         };
         showPurchaseModal = true;
     }
@@ -196,28 +250,36 @@
         try {
             const latestWallet = await UrlApi.getWalletInfo();
             wallet = latestWallet;
+            const requiredBalance =
+                getClickPurchaseCostE8s(pendingRequest.purchasedClicks) +
+                latestWallet.transferFeeE8s;
 
-            if (latestWallet.balanceE8s < latestWallet.tinyUrlPriceE8s + latestWallet.transferFeeE8s) {
+            if (latestWallet.balanceE8s < requiredBalance) {
                 throw new Error(
-                    `You need at least ${formatIcp(latestWallet.tinyUrlPriceE8s + latestWallet.transferFeeE8s)} ICP in your in-app wallet to cover the 1.0 ICP purchase and ledger fee.`
+                    `You need at least ${formatIcp(requiredBalance)} ICP in your in-app wallet to cover this click bundle purchase and the ledger fee.`
                 );
             }
 
             const shortenedUrl = await UrlApi.createShortUrl(
                 pendingRequest.originalUrl,
-                pendingRequest.customSlug
+                pendingRequest.customSlug,
+                pendingRequest.purchasedClicks
             );
             const hydratedUrl = await maybeHydratePreview(shortenedUrl);
             urls = [hydratedUrl, ...urls];
             newUrl = "";
             customSlug = "";
+            purchasedClicks = minimumPurchaseClicks;
             showPurchaseModal = false;
             pendingRequest = null;
             await loadWallet();
+            await refreshAutoShortCodePreview();
 
             const shortCode = hydratedUrl.shortCode;
             const fullShortUrl = getPublicShortUrl(shortCode);
-            showSuccess(`[>] Short URL created: ${fullShortUrl}`);
+            showSuccess(
+                `[>] Short URL created with ${formatClicks(hydratedUrl.allowance.remainingClicks)} prepaid clicks: ${fullShortUrl}`
+            );
         } catch (err) {
             error = "Failed to shorten URL: " + err.message;
             console.error("Error shortening URL:", err);
@@ -226,21 +288,34 @@
         }
     }
 
-    async function deleteUrl(id) {
+    function requestDeleteUrl(id) {
         const urlItem = urls.find((u) => u.id === id);
-        if (
-            !confirm(
-                `Are you sure you want to delete the short URL "${urlItem?.shortCode || "this URL"}"?`
-            )
-        )
+        if (!urlItem) {
+            error = "We could not find that short URL.";
             return;
+        }
+
+        deleteCandidate = urlItem;
+    }
+
+    function cancelDelete() {
+        deleteCandidate = null;
+    }
+
+    async function confirmDeleteUrl() {
+        if (!deleteCandidate) {
+            return;
+        }
+
+        const { id, shortCode } = deleteCandidate;
 
         loading = true;
         error = "";
         try {
             await UrlApi.deleteUrl(id);
             urls = urls.filter((url) => url.id !== id);
-            showSuccess(`Short URL deleted successfully`);
+            deleteCandidate = null;
+            showSuccess(`Deleted /${shortCode} from your TinyICP dashboard.`);
         } catch (err) {
             error = "Failed to delete URL: " + err.message;
             console.error("Error deleting URL:", err);
@@ -305,8 +380,386 @@
         return await UrlApi.saveUrlMetadata(url.id, metadata);
     }
 
+    function resetShortCodePreviewState() {
+        clearShortCodeCheckTimer();
+        autoShortCodePreview = "";
+        autoShortCodePreviewLoading = false;
+        autoShortCodePreviewError = "";
+        customShortCodeStatus = "idle";
+        customShortCodeMessage = "";
+        shortCodeCheckRequestId = 0;
+        autoShortCodePreviewRequestId = 0;
+    }
+
+    function clearShortCodeCheckTimer() {
+        if (shortCodeCheckTimer && typeof clearTimeout === "function") {
+            clearTimeout(shortCodeCheckTimer);
+        }
+
+        shortCodeCheckTimer = null;
+    }
+
+    function isValidCustomSlug(slug) {
+        return hasText(slug) && customSlugPattern.test(slug);
+    }
+
+    function getAutoShortCodePreviewStatus() {
+        if (autoShortCodePreviewLoading) {
+            return "checking";
+        }
+
+        if (autoShortCodePreviewError) {
+            return "error";
+        }
+
+        if (autoShortCodePreview) {
+            return "ready";
+        }
+
+        return "idle";
+    }
+
+    function getAutoShortCodePreviewMessage() {
+        if (autoShortCodePreviewLoading) {
+            return "Reserving the auto-generated short code for your next TinyICP URL...";
+        }
+
+        if (autoShortCodePreviewError) {
+            return autoShortCodePreviewError;
+        }
+
+        if (autoShortCodePreview) {
+            return "This auto-generated short code is reserved for your next purchase.";
+        }
+
+        return "Your auto-generated TinyICP URL will appear here before payment.";
+    }
+
+    function getShortCodePreviewStatusLabel(status, usingCustomShortCode) {
+        switch (status) {
+            case "ready":
+                return usingCustomShortCode ? "Available" : "Reserved";
+            case "checking":
+                return usingCustomShortCode ? "Checking" : "Reserving";
+            case "taken":
+                return "Taken";
+            case "invalid":
+                return "Invalid";
+            case "error":
+                return "Unavailable";
+            default:
+                return usingCustomShortCode ? "Custom Preview" : "Auto Preview";
+        }
+    }
+
+    function getShortCodePreviewPlaceholder(status, usingCustomShortCode) {
+        if (status === "checking") {
+            return "checking-code";
+        }
+
+        if (usingCustomShortCode) {
+            return "enter-a-code";
+        }
+
+        return "auto-code-preview";
+    }
+
+    function isShortCodeReadyForPurchase() {
+        if (isUsingCustomShortCode) {
+            return customShortCodeStatus === "ready";
+        }
+
+        return Boolean(autoShortCodePreview) && !autoShortCodePreviewLoading;
+    }
+
+    async function refreshAutoShortCodePreview() {
+        if (!authenticated) {
+            autoShortCodePreview = "";
+            autoShortCodePreviewError = "";
+            autoShortCodePreviewLoading = false;
+            return null;
+        }
+
+        const requestId = ++autoShortCodePreviewRequestId;
+        autoShortCodePreviewLoading = true;
+        autoShortCodePreviewError = "";
+
+        try {
+            const shortCode = await UrlApi.reserveShortCodePreview();
+            if (requestId !== autoShortCodePreviewRequestId) {
+                return null;
+            }
+
+            autoShortCodePreview = shortCode;
+            return shortCode;
+        } catch (err) {
+            if (requestId !== autoShortCodePreviewRequestId) {
+                return null;
+            }
+
+            autoShortCodePreview = "";
+            autoShortCodePreviewError =
+                "We couldn't reserve an auto-generated short code right now.";
+            console.error("Error reserving auto-generated short code:", err);
+            return null;
+        } finally {
+            if (requestId === autoShortCodePreviewRequestId) {
+                autoShortCodePreviewLoading = false;
+            }
+        }
+    }
+
+    async function updateCustomShortCodeAvailability(shortCode, requestId = null) {
+        try {
+            const isAvailable =
+                await UrlApi.checkShortCodeAvailability(shortCode);
+            if (
+                requestId !== null &&
+                requestId !== shortCodeCheckRequestId
+            ) {
+                return isAvailable;
+            }
+
+            customShortCodeStatus = isAvailable ? "ready" : "taken";
+            customShortCodeMessage = isAvailable
+                ? "Available now. TinyICP will reserve this custom short code before you pay."
+                : "That custom short code is already taken. Try another one.";
+            return isAvailable;
+        } catch (err) {
+            if (
+                requestId !== null &&
+                requestId !== shortCodeCheckRequestId
+            ) {
+                return false;
+            }
+
+            customShortCodeStatus = "error";
+            customShortCodeMessage =
+                "We couldn't verify that custom short code right now.";
+            console.error("Error checking short code availability:", err);
+            return false;
+        }
+    }
+
+    function syncShortCodePreview(isAuthenticated, shortCode) {
+        clearShortCodeCheckTimer();
+
+        if (!isAuthenticated) {
+            customShortCodeStatus = "idle";
+            customShortCodeMessage = "";
+            return;
+        }
+
+        if (!hasText(shortCode)) {
+            customShortCodeStatus = "idle";
+            customShortCodeMessage = "";
+
+            if (
+                (!autoShortCodePreview || autoShortCodePreviewError) &&
+                !autoShortCodePreviewLoading
+            ) {
+                void refreshAutoShortCodePreview();
+            }
+            return;
+        }
+
+        if (!isValidCustomSlug(shortCode)) {
+            customShortCodeStatus = "invalid";
+            customShortCodeMessage =
+                "Custom short codes can use only letters, numbers, hyphens, and underscores.";
+            return;
+        }
+
+        customShortCodeStatus = "checking";
+        customShortCodeMessage =
+            "Checking whether this custom short code is still available...";
+
+        const requestId = ++shortCodeCheckRequestId;
+        shortCodeCheckTimer = setTimeout(() => {
+            void updateCustomShortCodeAvailability(shortCode, requestId);
+        }, SHORT_CODE_CHECK_DEBOUNCE_MS);
+    }
+
+    function getPublicShortUrlPrefix() {
+        return UrlApi.getPublicShortUrlPrefix();
+    }
+
+    function formatClicks(value) {
+        return Number(value || 0).toLocaleString();
+    }
+
+    function isValidClickPurchase(value) {
+        const numericValue = Number(value);
+        return (
+            Number.isInteger(numericValue) &&
+            numericValue >= minimumPurchaseClicks &&
+            numericValue % clickBundleSize === 0
+        );
+    }
+
+    function getClickPurchaseCostE8s(clickCount) {
+        return (Number(clickCount) / clickBundleSize) * clickBundlePriceE8s;
+    }
+
+    function getClickPurchaseCostIcp(clickCount) {
+        return formatIcp(getClickPurchaseCostE8s(clickCount));
+    }
+
+    function getPurchaseTotalDebitIcp(clickCount) {
+        return formatIcp(
+            getClickPurchaseCostE8s(clickCount) +
+                (wallet?.transferFeeE8s ?? DEFAULT_LEDGER_FEE_E8S)
+        );
+    }
+
+    function getUrlStatusLabel(url) {
+        return url.allowance?.isActive ? "Active" : "Paused";
+    }
+
+    function getUrlStatusClass(url) {
+        return url.allowance?.isActive ? "active" : "paused";
+    }
+
+    function getUrlStatusMessage(url) {
+        if (url.allowance?.isActive) {
+            return `${formatClicks(url.allowance.remainingClicks)} prepaid clicks remaining before this URL pauses.`;
+        }
+
+        return "This URL is paused because its prepaid click balance is empty. Top it up to reactivate it.";
+    }
+
+    function getTopUpClicksValue(urlId) {
+        return topUpClicksByUrl[urlId] ?? minimumPurchaseClicks;
+    }
+
+    function setTopUpClicksValue(urlId, value) {
+        const numericValue = Number(value);
+        topUpClicksByUrl = {
+            ...topUpClicksByUrl,
+            [urlId]:
+                Number.isFinite(numericValue) && numericValue > 0
+                    ? Math.round(numericValue)
+                    : minimumPurchaseClicks
+        };
+    }
+
+    async function topUpUrl(id) {
+        const clickCount = getTopUpClicksValue(id);
+        const currentUrl = urls.find((url) => url.id === id);
+        const wasActive = currentUrl?.allowance?.isActive ?? true;
+
+        if (!isValidClickPurchase(clickCount)) {
+            error = `Top-ups must be at least ${formatClicks(minimumPurchaseClicks)} clicks and use ${formatClicks(clickBundleSize)}-click increments.`;
+            return;
+        }
+
+        loading = true;
+        topUpUrlId = id;
+        error = "";
+
+        try {
+            const latestWallet = await UrlApi.getWalletInfo();
+            wallet = latestWallet;
+            const requiredBalance =
+                getClickPurchaseCostE8s(clickCount) + latestWallet.transferFeeE8s;
+
+            if (latestWallet.balanceE8s < requiredBalance) {
+                throw new Error(
+                    `You need at least ${formatIcp(requiredBalance)} ICP in your in-app wallet to cover this top-up and the ledger fee.`
+                );
+            }
+
+            const updatedUrl = await UrlApi.topUpUrl(id, clickCount);
+            updateUrlInList(updatedUrl);
+            topUpClicksByUrl = {
+                ...topUpClicksByUrl,
+                [id]: minimumPurchaseClicks
+            };
+            await loadWallet();
+
+            showSuccess(
+                wasActive
+                    ? `Added ${formatClicks(clickCount)} clicks to /${updatedUrl.shortCode}.`
+                    : `Reactivated /${updatedUrl.shortCode} with ${formatClicks(clickCount)} new clicks.`
+            );
+        } catch (err) {
+            error = "Failed to top up URL clicks: " + err.message;
+            console.error("Error topping up URL clicks:", err);
+        } finally {
+            loading = false;
+            topUpUrlId = null;
+        }
+    }
+
+    function updateUrlInList(updatedUrl) {
+        urls = urls.map((url) => (url.id === updatedUrl.id ? updatedUrl : url));
+    }
+
+    function scheduleClickRefresh(shortCode) {
+        if (!shortCode || typeof window === "undefined") {
+            return;
+        }
+
+        const existingTimer = clickRefreshTimers.get(shortCode);
+        if (existingTimer) {
+            window.clearTimeout(existingTimer);
+        }
+
+        const timeoutId = window.setTimeout(async () => {
+            clickRefreshTimers.delete(shortCode);
+
+            try {
+                const updatedUrl = await UrlApi.getPublicUrl(shortCode);
+                if (updatedUrl) {
+                    updateUrlInList(updatedUrl);
+                }
+            } catch (refreshError) {
+                console.warn("Failed to refresh click count:", refreshError);
+            }
+        }, 1200);
+
+        clickRefreshTimers.set(shortCode, timeoutId);
+    }
+
     function getPublicShortUrl(shortCode) {
-        return `${getBackendBaseUrl(false)}/s/${shortCode}`;
+        return UrlApi.getPublicShortUrl(shortCode);
+    }
+
+    function getPreviewShortUrl(shortCode) {
+        return UrlApi.getBackendShortUrl(shortCode);
+    }
+
+    function getUrlOptions(url) {
+        const options = [
+            {
+                key: "preview",
+                label: "Preview URL",
+                description: "Longer, allows link previews",
+                href: getPreviewShortUrl(url.shortCode)
+            },
+            {
+                key: "tinyicp",
+                label: "TinyICP URL",
+                description: "Shorter, no link previews",
+                href: getPublicShortUrl(url.shortCode)
+            },
+            {
+                key: "original",
+                label: "Original URL",
+                description: "Direct destination URL",
+                href: url.originalUrl
+            }
+        ];
+
+        const seen = new Set();
+        return options.filter((option) => {
+            if (!hasText(option.href) || seen.has(option.href)) {
+                return false;
+            }
+
+            seen.add(option.href);
+            return true;
+        });
     }
 
     function hasText(value) {
@@ -397,12 +850,23 @@
         }, 2000);
     }
 
-    function openUrl(url) {
-        window.open(url, "_blank");
+    function openUrl(url, shortCode = null) {
+        window.open(url, "_blank", "noopener");
+        scheduleClickRefresh(shortCode);
     }
 
     function handleKeydown(event) {
         if (event.key === "Escape") {
+            if (deleteCandidate && !loading) {
+                cancelDelete();
+                return;
+            }
+
+            if (showPurchaseModal && !loading) {
+                cancelPurchase();
+                return;
+            }
+
             newUrl = "";
             customSlug = "";
             clearError();
@@ -470,15 +934,43 @@
         }
     }
 
-    $: purchasePriceIcp = wallet
-        ? formatIcp(wallet.tinyUrlPriceE8s)
-        : formatIcp(100_000_000);
+    $: clickBundleSize = wallet
+        ? wallet.clickBundleSize
+        : DEFAULT_CLICK_BUNDLE_SIZE;
+    $: clickBundlePriceE8s = wallet
+        ? wallet.clickBundlePriceE8s
+        : DEFAULT_CLICK_BUNDLE_PRICE_E8S;
+    $: minimumPurchaseClicks = wallet
+        ? wallet.minimumPurchaseClicks
+        : DEFAULT_MINIMUM_PURCHASE_CLICKS;
+    $: clickBundlePriceIcp = formatIcp(clickBundlePriceE8s);
+    $: minimumPurchaseCostIcp = wallet
+        ? formatIcp(wallet.minimumPurchaseCostE8s)
+        : formatIcp(DEFAULT_CLICK_BUNDLE_PRICE_E8S);
     $: ledgerFeeIcp = wallet
         ? formatIcp(wallet.transferFeeE8s)
-        : formatIcp(10_000);
-    $: totalRequiredIcp = wallet
-        ? formatIcp(wallet.tinyUrlPriceE8s + wallet.transferFeeE8s)
-        : formatIcp(100_010_000);
+        : formatIcp(DEFAULT_LEDGER_FEE_E8S);
+    $: if (!Number.isInteger(purchasedClicks) || purchasedClicks < minimumPurchaseClicks) {
+        purchasedClicks = minimumPurchaseClicks;
+    }
+    $: trimmedCustomSlug = customSlug.trim();
+    $: isUsingCustomShortCode = trimmedCustomSlug.length > 0;
+    $: shortCodePreviewValue = isUsingCustomShortCode
+        ? trimmedCustomSlug
+        : autoShortCodePreview;
+    $: shortCodePreviewStatus = isUsingCustomShortCode
+        ? customShortCodeStatus
+        : getAutoShortCodePreviewStatus();
+    $: shortCodePreviewMessage = isUsingCustomShortCode
+        ? customShortCodeMessage
+        : getAutoShortCodePreviewMessage();
+    $: canSubmitShorten =
+        !loading &&
+        Boolean(newUrl.trim()) &&
+        isValidUrl(newUrl) &&
+        isValidClickPurchase(purchasedClicks) &&
+        isShortCodeReadyForPurchase();
+    $: syncShortCodePreview(authenticated, trimmedCustomSlug);
 
     function formatDate(timestamp) {
         const milliseconds = Math.floor(timestamp / 1000000);
@@ -500,6 +992,11 @@
 
         return () => {
             document.removeEventListener("keydown", handleKeydown);
+            clearShortCodeCheckTimer();
+            for (const timeoutId of clickRefreshTimers.values()) {
+                window.clearTimeout(timeoutId);
+            }
+            clickRefreshTimers.clear();
         };
     });
 </script>
@@ -587,9 +1084,11 @@
                     </button>
                 </div>
                 <p class="wallet-help">
-                    Your Tiny ICP wallet shows your available balance, deposit
-                    account ID, and withdrawal tools for your authenticated
-                    identity.
+                    Your Tiny ICP wallet funds prepaid click bundles for every
+                    short URL. TinyICP charges {clickBundlePriceIcp} ICP per
+                    {formatClicks(clickBundleSize)} clicks, and URLs pause
+                    automatically whenever their prepaid clicks run out until
+                    you top them up again.
                 </p>
                 {#if walletLoading && !wallet}
                     <div class="wallet-status">Loading your wallet details...</div>
@@ -601,6 +1100,15 @@
                             <small>
                                 Deposit ICP into your account ID below to fund
                                 this wallet.
+                            </small>
+                        </div>
+                        <div class="wallet-card">
+                            <span class="wallet-label">Click bundle pricing</span>
+                            <strong>{clickBundlePriceIcp} ICP</strong>
+                            <small>
+                                Buys {formatClicks(clickBundleSize)} clicks.
+                                Minimum purchase: {formatClicks(minimumPurchaseClicks)}
+                                clicks ({minimumPurchaseCostIcp} ICP).
                             </small>
                         </div>
                         <div class="wallet-card full">
@@ -699,21 +1207,82 @@
                         <small class="form-help"
                             >Letters, numbers, hyphens, and underscores only</small
                         >
+                        <div
+                            class={`short-link-preview-card ${shortCodePreviewStatus}`}
+                        >
+                            <div class="short-link-preview-header">
+                                <span
+                                    class={`short-link-preview-badge ${shortCodePreviewStatus}`}
+                                >
+                                    {getShortCodePreviewStatusLabel(
+                                        shortCodePreviewStatus,
+                                        isUsingCustomShortCode
+                                    )}
+                                </span>
+                                <span class="short-link-preview-source">
+                                    {isUsingCustomShortCode
+                                        ? "Custom short code"
+                                        : "Auto-generated short code"}
+                                </span>
+                            </div>
+                            <code class="short-link-preview-url">
+                                <span class="short-link-preview-prefix">
+                                    {getPublicShortUrlPrefix()}
+                                </span>
+                                {#if shortCodePreviewValue}
+                                    <span>{shortCodePreviewValue}</span>
+                                {:else}
+                                    <span class="short-link-preview-placeholder">
+                                        {getShortCodePreviewPlaceholder(
+                                            shortCodePreviewStatus,
+                                            isUsingCustomShortCode
+                                        )}
+                                    </span>
+                                {/if}
+                            </code>
+                            <small
+                                class={`form-help short-link-preview-help ${shortCodePreviewStatus}`}
+                            >
+                                {shortCodePreviewMessage}
+                            </small>
+                        </div>
+                    </div>
+
+                    <div class="form-field">
+                        <label for="purchased-clicks" class="form-label"
+                            >Prepaid Clicks</label
+                        >
+                        <input
+                            id="purchased-clicks"
+                            type="number"
+                            min={minimumPurchaseClicks}
+                            step={clickBundleSize}
+                            bind:value={purchasedClicks}
+                            disabled={loading}
+                            class="form-input"
+                        />
+                        <small class="form-help">
+                            {clickBundlePriceIcp} ICP per {formatClicks(clickBundleSize)}
+                            clicks. URLs pause automatically when they hit 0
+                            remaining clicks and can be reactivated any time
+                            with a top-up.
+                        </small>
                     </div>
 
                     <div class="action-row">
                         <button
                             type="submit"
-                            disabled={loading || !newUrl.trim() || !isValidUrl(newUrl)}
+                            disabled={!canSubmitShorten}
                             class="shorten-btn"
                         >
                             {loading ? "Shortening..." : "[>] Shorten URL"}
                         </button>
                     </div>
                     <p class="form-help preview-note">
-                        New short URLs are created only through the authenticated
-                        wallet flow, and each purchase now captures destination
-                        page metadata for sharing previews.
+                        New short URLs are created through the authenticated
+                        wallet flow, include prepaid clicks up front, and pause
+                        automatically whenever their allowance runs out until
+                        you top them up again.
                     </p>
                 </form>
             </div>
@@ -727,29 +1296,123 @@
                         aria-modal="true"
                         aria-labelledby="purchase-modal-title"
                     >
-                        <p class="auth-kicker">Purchase confirmation</p>
-                        <h2 id="purchase-modal-title">Confirm Tiny URL purchase</h2>
+                        <p class="modal-kicker">Purchase confirmation</p>
+                        <h2 id="purchase-modal-title">Confirm Tiny URL creation</h2>
                         <p>
-                            Creating this short URL will transfer <strong>{purchasePriceIcp} ICP</strong>
-                            from your in-app wallet to the Tiny ICP payment account before the link is created.
+                            Creating this short URL will transfer
+                            <strong>{getClickPurchaseCostIcp(pendingRequest?.purchasedClicks || minimumPurchaseClicks)} ICP</strong>
+                            from your in-app wallet to prepay
+                            <strong>{formatClicks(pendingRequest?.purchasedClicks || minimumPurchaseClicks)} clicks</strong>.
+                            If those clicks run out, the URL pauses until it is
+                            topped up.
                         </p>
+                        <div class="short-link-preview-card ready payment-preview-card">
+                            <div class="short-link-preview-header">
+                                <span class="short-link-preview-badge ready">
+                                    {pendingRequest?.customSlug
+                                        ? "Reserved Custom URL"
+                                        : "Reserved Auto URL"}
+                                </span>
+                                <span class="short-link-preview-source">
+                                    This is the TinyICP URL you are about to pay for
+                                </span>
+                            </div>
+                            <code class="short-link-preview-url">
+                                <span class="short-link-preview-prefix">
+                                    {getPublicShortUrlPrefix()}
+                                </span>
+                                <span>{pendingRequest?.previewShortCode}</span>
+                            </code>
+                            <small class="form-help short-link-preview-help ready">
+                                {pendingRequest?.customSlug
+                                    ? "Your custom short code is reserved for this checkout step."
+                                    : "This auto-generated short code is reserved for this checkout step."}
+                            </small>
+                        </div>
                         <div class="wallet-status">
                             <div><strong>Long URL:</strong> {pendingRequest?.originalUrl}</div>
+                            <div>
+                                <strong>TinyICP URL:</strong>
+                                {pendingRequest?.previewShortCode
+                                    ? getPublicShortUrl(pendingRequest.previewShortCode)
+                                    : "Preparing preview..."}
+                            </div>
                             <div>
                                 <strong>Custom short code:</strong>
                                 {pendingRequest?.customSlug || "Auto-generate one for me"}
                             </div>
-                            <div><strong>Price:</strong> {purchasePriceIcp} ICP</div>
+                            <div><strong>Prepaid clicks:</strong> {formatClicks(pendingRequest?.purchasedClicks || minimumPurchaseClicks)}</div>
+                            <div><strong>Price:</strong> {getClickPurchaseCostIcp(pendingRequest?.purchasedClicks || minimumPurchaseClicks)} ICP</div>
                             <div><strong>Ledger fee:</strong> {ledgerFeeIcp} ICP</div>
                             <div><strong>Wallet balance:</strong> {wallet ? `${formatIcp(wallet.balanceE8s)} ICP` : "Loading..."}</div>
-                            <div><strong>Needed to proceed:</strong> {totalRequiredIcp} ICP</div>
+                            <div><strong>Needed to proceed:</strong> {getPurchaseTotalDebitIcp(pendingRequest?.purchasedClicks || minimumPurchaseClicks)} ICP</div>
                         </div>
                         <div class="action-row modal-actions">
                             <button type="button" class="refresh-btn" on:click={cancelPurchase} disabled={loading}>
                                 Cancel
                             </button>
                             <button type="button" class="shorten-btn" on:click={confirmPurchase} disabled={loading}>
-                                {loading ? "Processing payment..." : `Confirm & Pay ${purchasePriceIcp} ICP`}
+                                {loading
+                                    ? "Processing payment..."
+                                    : `Confirm & Pay ${getClickPurchaseCostIcp(pendingRequest?.purchasedClicks || minimumPurchaseClicks)} ICP`}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            {/if}
+
+            {#if deleteCandidate}
+                <div class="modal-backdrop" role="presentation">
+                    <div
+                        class="confirm-modal danger-modal"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="delete-modal-title"
+                    >
+                        <p class="modal-kicker danger-kicker">Danger zone</p>
+                        <h2 id="delete-modal-title">Delete /{deleteCandidate.shortCode}?</h2>
+                        <p>
+                            This permanently removes the short URL from your TinyICP dashboard and
+                            discards any remaining prepaid clicks attached to it. This action
+                            cannot be undone.
+                        </p>
+                        <div class="wallet-status delete-summary">
+                            <div>
+                                <strong>TinyICP URL:</strong>
+                                {getPublicShortUrl(deleteCandidate.shortCode)}
+                            </div>
+                            <div>
+                                <strong>Destination:</strong> {deleteCandidate.originalUrl}
+                            </div>
+                            <div>
+                                <strong>Remaining prepaid clicks:</strong>
+                                {formatClicks(deleteCandidate.allowance?.remainingClicks || 0)}
+                            </div>
+                            <div>
+                                <strong>Total recorded clicks:</strong>
+                                {formatClicks(deleteCandidate.clicks)}
+                            </div>
+                        </div>
+                        <p class="modal-note danger-note">
+                            Delete only if you are sure nobody should be able to use this short link
+                            anymore.
+                        </p>
+                        <div class="action-row modal-actions">
+                            <button
+                                type="button"
+                                class="refresh-btn"
+                                on:click={cancelDelete}
+                                disabled={loading}
+                            >
+                                Keep URL
+                            </button>
+                            <button
+                                type="button"
+                                class="danger-btn"
+                                on:click={confirmDeleteUrl}
+                                disabled={loading}
+                            >
+                                {loading ? "Deleting URL..." : "Delete Permanently"}
                             </button>
                         </div>
                     </div>
@@ -780,28 +1443,17 @@
                                         <h3 class="short-code">/{url.shortCode}</h3>
                                         <div class="url-actions">
                                             <button
-                                                class="copy-btn small"
-                                                class:copied={copiedShortUrl ===
-                                                    getPublicShortUrl(url.shortCode)}
-                                                on:click={() =>
-                                                    copyToClipboard(
-                                                        getPublicShortUrl(url.shortCode)
-                                                    )}
-                                            >
-                                                {copiedShortUrl ===
-                                                getPublicShortUrl(url.shortCode)
-                                                    ? "Copied ✓"
-                                                    : "Copy Url"}
-                                            </button>
-                                            <button
                                                 class="visit-btn"
                                                 on:click={() =>
-                                                    openUrl(getPublicShortUrl(url.shortCode))}
+                                                    openUrl(
+                                                        getPublicShortUrl(url.shortCode),
+                                                        url.shortCode
+                                                    )}
                                             >
                                                 ↗
                                             </button>
                                             <button
-                                                on:click={() => deleteUrl(url.id)}
+                                                on:click={() => requestDeleteUrl(url.id)}
                                                 disabled={loading}
                                                 class="delete-btn"
                                             >
@@ -811,79 +1463,229 @@
                                     </div>
 
                                     <div class="url-details">
-                                        <p class="short-url">
-                                            <strong>Short:</strong>
-                                            <a
-                                                href={getPublicShortUrl(url.shortCode)}
-                                                target="_blank"
-                                                rel="noopener"
-                                            >
-                                                {getPublicShortUrl(url.shortCode)}
-                                            </a>
-                                        </p>
-                                        <p class="original-url">
-                                            <strong>Original:</strong>
-                                            <a
-                                                href={url.originalUrl}
-                                                target="_blank"
-                                                rel="noopener"
-                                                class="original-link"
-                                            >
-                                                {url.originalUrl}
-                                            </a>
-                                        </p>
+                                        <a
+                                            href={getPublicShortUrl(url.shortCode)}
+                                            target="_blank"
+                                            rel="noopener"
+                                            class="url-primary-link"
+                                            on:click={() =>
+                                                scheduleClickRefresh(url.shortCode)}
+                                        >
+                                            {getPublicShortUrl(url.shortCode)}
+                                        </a>
                                         <div class="url-stats">
-                                            <span class="stat">[HITS] {url.clicks || 0} clicks</span>
+                                            <span class={`stat stat-status ${getUrlStatusClass(url)}`}>
+                                                [STATUS] {getUrlStatusLabel(url)}
+                                            </span>
+                                            <span class="stat">
+                                                [REMAINING] {formatClicks(url.allowance.remainingClicks)} clicks
+                                            </span>
+                                            <span class="stat">[HITS] {formatClicks(url.clicks)} clicks</span>
                                             <span class="stat">[DATE] {formatDate(url.createdAt)}</span>
                                         </div>
-                                        <div class="preview-panel">
-                                            <div class="preview-panel-header">
+                                        <details class="url-section-toggle">
+                                            <summary class="url-section-summary">
+                                                <span
+                                                    class={`allowance-badge ${getUrlStatusClass(
+                                                        url
+                                                    )}`}
+                                                >
+                                                    {getUrlStatusLabel(url)}
+                                                </span>
+                                                <span class="url-section-hint">
+                                                    {formatClicks(url.allowance.remainingClicks)}
+                                                    prepaid clicks left
+                                                </span>
+                                            </summary>
+                                            <div class="billing-panel">
+                                                <p class="preview-meta">
+                                                    <strong>Prepaid clicks purchased:</strong>
+                                                    {formatClicks(
+                                                        url.allowance.totalPurchasedClicks
+                                                    )}
+                                                </p>
+                                                <p class="preview-meta">
+                                                    <strong>Remaining clicks:</strong>
+                                                    {formatClicks(
+                                                        url.allowance.remainingClicks
+                                                    )}
+                                                </p>
+                                                <p class="preview-meta">
+                                                    <strong>Status:</strong>
+                                                    {getUrlStatusMessage(url)}
+                                                </p>
+                                                <div class="billing-topup-grid">
+                                                    <div class="form-field">
+                                                        <label
+                                                            for={`top-up-clicks-${url.id}`}
+                                                            class="form-label"
+                                                        >
+                                                            Top Up Clicks
+                                                        </label>
+                                                        <input
+                                                            id={`top-up-clicks-${url.id}`}
+                                                            type="number"
+                                                            min={minimumPurchaseClicks}
+                                                            step={clickBundleSize}
+                                                            value={getTopUpClicksValue(url.id)}
+                                                            class="form-input"
+                                                            disabled={loading}
+                                                            on:input={(event) =>
+                                                                setTopUpClicksValue(
+                                                                    url.id,
+                                                                    event.currentTarget
+                                                                        .valueAsNumber
+                                                                )}
+                                                        />
+                                                    </div>
+                                                    <div class="action-row billing-actions">
+                                                        <small class="wallet-help">
+                                                            {clickBundlePriceIcp} ICP per
+                                                            {formatClicks(clickBundleSize)} clicks.
+                                                            Every top-up also includes the
+                                                            {ledgerFeeIcp} ICP ledger fee.
+                                                        </small>
+                                                        <button
+                                                            type="button"
+                                                            class="refresh-btn"
+                                                            on:click={() =>
+                                                                topUpUrl(url.id)}
+                                                            disabled={loading ||
+                                                                !isValidClickPurchase(
+                                                                    getTopUpClicksValue(
+                                                                        url.id
+                                                                    )
+                                                                )}
+                                                        >
+                                                            {topUpUrlId === url.id
+                                                                ? "Processing..."
+                                                                : url.allowance.isActive
+                                                                    ? `Top Up ${getClickPurchaseCostIcp(
+                                                                            getTopUpClicksValue(
+                                                                                url.id
+                                                                            )
+                                                                        )} ICP`
+                                                                    : `Reactivate for ${getClickPurchaseCostIcp(
+                                                                            getTopUpClicksValue(
+                                                                                url.id
+                                                                            )
+                                                                        )} ICP`}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </details>
+                                        <details class="url-section-toggle">
+                                            <summary class="url-section-summary">
+                                                <span>Link options ({getUrlOptions(url).length})</span>
+                                                <span class="url-section-hint"
+                                                    >Expand to copy or view all URLs</span
+                                                >
+                                            </summary>
+                                            <div class="url-links">
+                                                {#each getUrlOptions(url) as option (option.key)}
+                                                    <div class="url-link-row">
+                                                        <div class="url-link-top">
+                                                            <div class="url-link-meta">
+                                                                <strong class="url-link-label"
+                                                                    >{option.label}</strong
+                                                                >
+                                                                <span class="url-link-description"
+                                                                    >{option.description}</span
+                                                                >
+                                                            </div>
+                                                            <button
+                                                                type="button"
+                                                                class="copy-btn small"
+                                                                class:copied={copiedShortUrl ===
+                                                                    option.href}
+                                                                on:click={() =>
+                                                                    copyToClipboard(option.href)}
+                                                            >
+                                                                {copiedShortUrl === option.href
+                                                                    ? "Copied ✓"
+                                                                    : "Copy URL"}
+                                                            </button>
+                                                        </div>
+                                                        <a
+                                                            href={option.href}
+                                                            target="_blank"
+                                                            rel="noopener"
+                                                            class="url-link-anchor"
+                                                            class:original-link={option.key ===
+                                                                "original"}
+                                                            on:click={() =>
+                                                                scheduleClickRefresh(
+                                                                    option.key === "original"
+                                                                        ? null
+                                                                        : url.shortCode
+                                                                )}
+                                                        >
+                                                            {option.href}
+                                                        </a>
+                                                    </div>
+                                                {/each}
+                                            </div>
+                                        </details>
+                                        <details class="url-section-toggle">
+                                            <summary class="url-section-summary">
                                                 <span
                                                     class={`preview-badge ${getPreviewStatus(
                                                         url
                                                     )}`}
                                                     >{getPreviewStatusLabel(url)}</span
                                                 >
-                                                <button
-                                                    type="button"
-                                                    class="refresh-btn preview-refresh-btn"
-                                                    on:click={() =>
-                                                        refreshUrlPreview(url.id)}
-                                                    disabled={loading ||
-                                                        isRefreshingPreview(url.id)}
+                                                <span class="url-section-hint"
+                                                    >Expand to view preview details</span
                                                 >
-                                                    {isRefreshingPreview(url.id)
-                                                        ? "Refreshing..."
-                                                        : "Refresh Preview"}
-                                                </button>
+                                            </summary>
+                                            <div class="preview-panel">
+                                                <div class="preview-panel-header">
+                                                    <button
+                                                        type="button"
+                                                        class="refresh-btn preview-refresh-btn"
+                                                        on:click={() =>
+                                                            refreshUrlPreview(url.id)}
+                                                        disabled={loading ||
+                                                            isRefreshingPreview(url.id)}
+                                                    >
+                                                        {isRefreshingPreview(url.id)
+                                                            ? "Refreshing..."
+                                                            : "Refresh Preview"}
+                                                    </button>
+                                                </div>
+                                                {#if url.metadata}
+                                                    {#if url.metadata.title}
+                                                        <p class="preview-meta">
+                                                            <strong>Title:</strong>
+                                                            {url.metadata.title}
+                                                        </p>
+                                                    {/if}
+                                                    {#if url.metadata.description}
+                                                        <p class="preview-meta">
+                                                            <strong>Description:</strong>
+                                                            {url.metadata.description}
+                                                        </p>
+                                                    {/if}
+                                                    {#if url.metadata.imageUrl}
+                                                        <p class="preview-meta">
+                                                            <strong>Image:</strong>
+                                                            <a
+                                                                href={url.metadata.imageUrl}
+                                                                target="_blank"
+                                                                rel="noopener"
+                                                            >
+                                                                {url.metadata.imageUrl}
+                                                            </a>
+                                                        </p>
+                                                    {/if}
+                                                {:else}
+                                                    <p class="preview-meta">
+                                                        Preview metadata has not been captured yet.
+                                                    </p>
+                                                {/if}
                                             </div>
-                                            {#if url.metadata}
-                                                {#if url.metadata.title}
-                                                    <p class="preview-meta">
-                                                        <strong>Title:</strong>
-                                                        {url.metadata.title}
-                                                    </p>
-                                                {/if}
-                                                {#if url.metadata.description}
-                                                    <p class="preview-meta">
-                                                        <strong>Description:</strong>
-                                                        {url.metadata.description}
-                                                    </p>
-                                                {/if}
-                                                {#if url.metadata.imageUrl}
-                                                    <p class="preview-meta">
-                                                        <strong>Image:</strong>
-                                                        <a
-                                                            href={url.metadata.imageUrl}
-                                                            target="_blank"
-                                                            rel="noopener"
-                                                        >
-                                                            {url.metadata.imageUrl}
-                                                        </a>
-                                                    </p>
-                                                {/if}
-                                            {/if}
-                                        </div>
+                                        </details>
                                     </div>
                                 </div>
                             </div>

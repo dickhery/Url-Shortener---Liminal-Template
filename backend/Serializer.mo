@@ -1,4 +1,5 @@
 import UrlStore "UrlStore";
+import Pricing "Pricing";
 import Json "mo:json@1";
 import Result "mo:core@1/Result";
 import Text "mo:core@1/Text";
@@ -22,6 +23,7 @@ module {
     #ok({
       originalUrl = originalUrl;
       customSlug = customSlug;
+      purchasedClicks = Pricing.minimumPurchaseClicks;
     });
   };
 };

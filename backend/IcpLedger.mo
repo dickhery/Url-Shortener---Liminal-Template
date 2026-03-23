@@ -14,11 +14,11 @@ import Result "mo:core@1/Result";
 import Text "mo:core@1/Text";
 import Time "mo:core@1/Time";
 import VarArray "mo:core@1/VarArray";
+import Pricing "Pricing";
 
 module {
   public let ledger : Ledger = actor ("ryjl3-tyaaa-aaaaa-aaaba-cai");
   public let transferFeeE8s : Nat = 10_000;
-  public let tinyUrlPriceE8s : Nat = 1_000_000;
   public let targetAccountId : Text = "91cfa92ae9d2cb6f5fe0db77f7017dff6c3f86ccca2fdf564d1348b56347be18";
 
   public type Tokens = { e8s : Nat64 };
@@ -53,7 +53,10 @@ module {
     subaccountHex : Text;
     balanceE8s : Nat;
     transferFeeE8s : Nat;
-    tinyUrlPriceE8s : Nat;
+    clickBundleSize : Nat;
+    clickBundlePriceE8s : Nat;
+    minimumPurchaseClicks : Nat;
+    minimumPurchaseCostE8s : Nat;
     paymentTargetAccountId : Text;
   };
 
@@ -90,17 +93,32 @@ module {
       subaccountHex = toHex(subaccountForPrincipal(user));
       balanceE8s = Nat64.toNat(balance.e8s);
       transferFeeE8s;
-      tinyUrlPriceE8s;
+      clickBundleSize = Pricing.clickBundleSize;
+      clickBundlePriceE8s = Pricing.clickBundlePriceE8s;
+      minimumPurchaseClicks = Pricing.minimumPurchaseClicks;
+      minimumPurchaseCostE8s = Pricing.minimumPurchaseCostE8s;
       paymentTargetAccountId = targetAccountId;
     };
   };
 
-  public func hasSufficientBalance(balanceE8s : Nat) : Bool {
-    balanceE8s >= tinyUrlPriceE8s + transferFeeE8s;
+  public func hasSufficientBalanceForClickPurchase(balanceE8s : Nat, purchasedClicks : Nat) : Bool {
+    balanceE8s >= Pricing.priceForClicks(purchasedClicks) + transferFeeE8s;
   };
 
-  public func chargeForUrl(canisterPrincipal : Principal, user : Principal) : async Result.Result<(), Text> {
-    await transferFromWallet(canisterPrincipal, user, targetAccountId, tinyUrlPriceE8s, ?(tinyUrlPriceE8s + transferFeeE8s));
+  public func chargeForClicks(
+    canisterPrincipal : Principal,
+    user : Principal,
+    purchasedClicks : Nat,
+  ) : async Result.Result<(), Text> {
+    if (not Pricing.isValidClickPurchase(purchasedClicks)) {
+      return #err(
+        "TinyICP click purchases start at " # Nat.toText(Pricing.minimumPurchaseClicks) #
+        " clicks and must be bought in " # Nat.toText(Pricing.clickBundleSize) # "-click increments."
+      );
+    };
+
+    let amountE8s = Pricing.priceForClicks(purchasedClicks);
+    await transferFromWallet(canisterPrincipal, user, targetAccountId, amountE8s, ?(amountE8s + transferFeeE8s));
   };
 
   public func withdrawFromWallet(

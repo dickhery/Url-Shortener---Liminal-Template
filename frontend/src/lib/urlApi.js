@@ -1,38 +1,10 @@
-import { building } from "$app/environment";
-import { canisterId } from "./canisters.js";
 import { getBackendActor } from "./backendActor.js";
-
-const getHostEnvironment = () => {
-  if (typeof window === "undefined") {
-    return { kind: "local", port: "4943" };
-  }
-
-  const { hostname, port } = window.location;
-  const isLocalHost =
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname.endsWith(".localhost");
-
-  return {
-    kind: isLocalHost ? "local" : "ic",
-    port: port || "4943",
-  };
-};
-
-const getBaseUrl = (raw = true) => {
-  if (building || process.env.NODE_ENV === "test") {
-    return "/";
-  }
-
-  const { kind, port } = getHostEnvironment();
-  const canisterIdAndRaw = raw ? `${canisterId}.raw` : canisterId;
-
-  if (kind === "local") {
-    return `http://${canisterIdAndRaw}.localhost:${port}`;
-  }
-
-  return `https://${canisterIdAndRaw}.icp0.io`;
-};
+import {
+  buildShortLink,
+  buildShortLinkPrefix,
+  getBackendOrigin,
+  getPublicShortLinkOrigin,
+} from "./urlConfig.js";
 
 const unwrapResult = (result, action) => {
   if ("ok" in result) {
@@ -67,12 +39,19 @@ const normalizeMetadata = (metadata) => {
   };
 };
 
+const normalizeAllowance = (allowance) => ({
+  totalPurchasedClicks: Number(allowance.totalPurchasedClicks),
+  remainingClicks: Number(allowance.remainingClicks),
+  isActive: Boolean(allowance.isActive),
+});
+
 const normalizeUrl = (url) => ({
   ...url,
   id: Number(url.id),
   clicks: Number(url.clicks),
   createdAt: Number(url.createdAt),
   metadata: normalizeMetadata(url.metadata),
+  allowance: normalizeAllowance(url.allowance),
 });
 
 const toOptional = (value) => (hasText(value) ? [value.trim()] : []);
@@ -182,7 +161,10 @@ const normalizeWallet = (wallet) => ({
   canisterPrincipal: wallet.canisterPrincipal.toText(),
   balanceE8s: Number(wallet.balanceE8s),
   transferFeeE8s: Number(wallet.transferFeeE8s),
-  tinyUrlPriceE8s: Number(wallet.tinyUrlPriceE8s),
+  clickBundleSize: Number(wallet.clickBundleSize),
+  clickBundlePriceE8s: Number(wallet.clickBundlePriceE8s),
+  minimumPurchaseClicks: Number(wallet.minimumPurchaseClicks),
+  minimumPurchaseCostE8s: Number(wallet.minimumPurchaseCostE8s),
   paymentTargetAccountId: wallet.paymentTargetAccountId,
 });
 
@@ -206,14 +188,38 @@ export class UrlApi {
     return urls.map(normalizeUrl);
   }
 
+  static async getPublicUrl(shortCode) {
+    if (!hasText(shortCode)) {
+      throw new Error("Short code is required");
+    }
+
+    const actor = await getBackendActor();
+    const url = unwrapOptional(await actor.get_public_url(shortCode.trim()));
+    return url ? normalizeUrl(url) : null;
+  }
+
   static async getWalletInfo() {
     const actor = await getBackendActor();
     return normalizeWallet(await actor.get_wallet_info());
   }
 
-  static async createShortUrl(originalUrl, customSlug = null) {
+  static async recordShortLinkVisit(shortCode) {
+    if (!hasText(shortCode)) {
+      throw new Error("Short code is required");
+    }
+
+    const actor = await getBackendActor();
+    const result = await actor.record_short_link_visit(shortCode.trim());
+    return normalizeUrl(unwrapResult(result, "record short URL visit"));
+  }
+
+  static async createShortUrl(originalUrl, customSlug = null, purchasedClicks) {
     if (!originalUrl || !originalUrl.trim()) {
       throw new Error("Original URL is required");
+    }
+
+    if (!Number.isFinite(purchasedClicks) || purchasedClicks <= 0) {
+      throw new Error("A prepaid click amount is required");
     }
 
     try {
@@ -225,10 +231,21 @@ export class UrlApi {
     const actor = await getBackendActor();
     const result = await actor.create_my_url({
       originalUrl,
+      purchasedClicks: BigInt(purchasedClicks),
       customSlug: customSlug ? [customSlug] : [],
     });
 
     return normalizeUrl(unwrapResult(result, "create short URL"));
+  }
+
+  static async topUpUrl(id, purchasedClicks) {
+    if (!Number.isFinite(purchasedClicks) || purchasedClicks <= 0) {
+      throw new Error("A prepaid click amount is required");
+    }
+
+    const actor = await getBackendActor();
+    const result = await actor.top_up_my_url(BigInt(id), BigInt(purchasedClicks));
+    return normalizeUrl(unwrapResult(result, "top up URL clicks"));
   }
 
   static async deleteUrl(id) {
@@ -241,6 +258,30 @@ export class UrlApi {
     const actor = await getBackendActor();
     const result = await actor.refresh_my_url_metadata(BigInt(id));
     return normalizeUrl(unwrapResult(result, "refresh preview metadata"));
+  }
+
+  static async checkShortCodeAvailability(shortCode) {
+    if (!hasText(shortCode)) {
+      throw new Error("Short code is required");
+    }
+
+    const actor = await getBackendActor();
+    return unwrapResult(
+      await actor.check_short_code_availability(shortCode.trim()),
+      "check short code availability",
+    );
+  }
+
+  static async reserveAutoShortCodePreview() {
+    return this.reserveShortCodePreview(null);
+  }
+
+  static async reserveShortCodePreview(shortCode = null) {
+    const actor = await getBackendActor();
+    return unwrapResult(
+      await actor.reserve_short_code_preview(shortCode ? [shortCode.trim()] : []),
+      "reserve short code preview",
+    );
   }
 
   static async saveUrlMetadata(id, metadata) {
@@ -303,12 +344,24 @@ export class UrlApi {
     unwrapResult(result, "withdraw ICP from wallet");
   }
 
+  static getPublicShortUrl(shortCode) {
+    return buildShortLink(getPublicShortLinkOrigin(), shortCode);
+  }
+
+  static getPublicShortUrlPrefix() {
+    return buildShortLinkPrefix(getPublicShortLinkOrigin());
+  }
+
   static getShortUrl(shortCode) {
-    return `${getBaseUrl(false)}/s/${shortCode}`;
+    return this.getPublicShortUrl(shortCode);
+  }
+
+  static getBackendShortUrl(shortCode, raw = false) {
+    return buildShortLink(getBackendOrigin(raw), shortCode);
   }
 
   static async getUrlStats(shortCode) {
-    const response = await fetch(`${getBaseUrl()}/s/${shortCode}/stats`, {
+    const response = await fetch(`${this.getBackendShortUrl(shortCode, true)}/stats`, {
       method: "GET",
       headers: {
         Accept: "application/json",

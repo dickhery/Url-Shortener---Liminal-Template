@@ -11,6 +11,7 @@ import Iter "mo:core@1/Iter";
 import UrlKit "mo:url-kit@3";
 import Runtime "mo:core@1/Runtime";
 import Principal "mo:core@1/Principal";
+import Pricing "Pricing";
 
 module {
 
@@ -35,11 +36,22 @@ module {
     public func redirect<system>(routeContext : RouteContext.RouteContext) : Route.HttpResponse {
       let shortCode = routeContext.getRouteParam("shortCode");
 
-      switch (store.incrementClicks(shortCode)) {
-        case (null) {
+      switch (store.recordVisit(shortCode)) {
+        case (#notFound) {
           routeContext.buildResponse(#notFound, #error(#message("Short URL not found")));
         };
-        case (?url) {
+        case (#inactive(url)) {
+          let shortUrl = buildShortUrl(routeContext, shortCode);
+          let html = generateInactiveHtml(shortUrl, shortCode, store.toView(url));
+          routeContext.buildResponse(
+            #forbidden,
+            #custom({
+              body = Text.encodeUtf8(html);
+              headers = buildRedirectHeaders();
+            }),
+          );
+        };
+        case (#ok(url)) {
           let shortUrl = buildShortUrl(routeContext, shortCode);
           let html = generateRedirectHtml(shortUrl, shortCode, url.originalUrl, url.metadata);
           routeContext.buildResponse(
@@ -76,7 +88,11 @@ module {
         };
         case (?"text/plain") {
           let ?body : ?Text = routeContext.parseUtf8Body() else Runtime.trap("Failed to decode request body as UTF-8");
-          { originalUrl = body; customSlug = null };
+          {
+            originalUrl = body;
+            customSlug = null;
+            purchasedClicks = Pricing.minimumPurchaseClicks;
+          };
         };
         case _ {
           switch (routeContext.parseJsonBody<UrlStore.CreateRequest>(Serializer.deserializeCreateRequest)) {
@@ -116,6 +132,7 @@ module {
       let ?body : ?Text = routeContext.parseUtf8Body() else Runtime.trap("Failed to decode request body as UTF-8");
       var originalUrl = "";
       var customSlug : ?Text = null;
+      var purchasedClicks = Pricing.minimumPurchaseClicks;
 
       let pairs = Text.split(body, #char('&'));
       for (pair in pairs) {
@@ -135,15 +152,22 @@ module {
             originalUrl := value;
           } else if (key == "slug") {
             customSlug := ?value;
+          } else if (key == "clicks") {
+            let ?parsedClicks = Nat.fromText(value) else Runtime.trap("Failed to decode clicks as Nat");
+            purchasedClicks := parsedClicks;
           };
         };
       };
 
-      { originalUrl = originalUrl; customSlug = customSlug };
+      {
+        originalUrl = originalUrl;
+        customSlug = customSlug;
+        purchasedClicks = purchasedClicks;
+      };
     };
 
     func toCandid(value : Blob) : Serde.Candid.Candid {
-      let urlKeys = ["id", "originalUrl", "shortCode", "clicks", "createdAt", "metadata"];
+      let urlKeys = ["id", "originalUrl", "shortCode", "clicks", "createdAt", "metadata", "allowance"];
       let options : ?Serde.Options = ?{
         renameKeys = [];
         blob_contains_only_values = false;
@@ -245,6 +269,59 @@ module {
       "      <p>If you are not redirected automatically, <a href=\"" # escapedOriginalUrl # "\">click here</a>.</p>\n" #
       "    </div>\n" #
       "    <script>setTimeout(() => { window.location.replace('" # escapeJsString(originalUrl) # "'); }, 300);</script>\n" #
+      "</body>\n" #
+      "</html>";
+    };
+
+    func generateInactiveHtml(shortUrl : Text, shortCode : Text, urlView : UrlStore.UrlView) : Text {
+      let escapedShortUrl = escapeHtml(shortUrl);
+      let title = "TinyICP Link Paused - " # shortCode;
+      let description =
+        "This short URL is currently inactive because its prepaid click allowance has been exhausted. The owner can top it up in TinyICP to reactivate it.";
+      let siteName = switch (urlView.metadata) {
+        case (?data) chooseText(data.siteName, "TinyICP");
+        case null "TinyICP";
+      };
+      let escapedTitle = escapeHtml(title);
+      let escapedDescription = escapeHtml(description);
+      let escapedSiteName = escapeHtml(siteName);
+
+      "<!DOCTYPE html>\n" #
+      "<html lang=\"en\">\n" #
+      "<head>\n" #
+      "    <meta charset=\"UTF-8\">\n" #
+      "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n" #
+      "    <title>" # escapedTitle # "</title>\n" #
+      "    <link rel=\"canonical\" href=\"" # escapedShortUrl # "\">\n" #
+      "    <meta property=\"og:type\" content=\"website\">\n" #
+      "    <meta property=\"og:url\" content=\"" # escapedShortUrl # "\">\n" #
+      "    <meta property=\"og:title\" content=\"" # escapedTitle # "\">\n" #
+      "    <meta property=\"og:description\" content=\"" # escapedDescription # "\">\n" #
+      "    <meta property=\"og:site_name\" content=\"" # escapedSiteName # "\">\n" #
+      "    <meta name=\"twitter:card\" content=\"summary\">\n" #
+      "    <meta name=\"twitter:url\" content=\"" # escapedShortUrl # "\">\n" #
+      "    <meta name=\"twitter:title\" content=\"" # escapedTitle # "\">\n" #
+      "    <meta name=\"twitter:description\" content=\"" # escapedDescription # "\">\n" #
+      "    <style>\n" #
+      "      body { font-family: monospace; background: #000; color: #00ff9c; padding: 40px; text-align: center; font-size: 18px; }\n" #
+      "      .panel { max-width: 700px; margin: 10vh auto; border: 1px solid #ffcc00; padding: 32px; box-shadow: 0 0 24px rgba(255, 204, 0, 0.15); background: rgba(0,0,0,0.92); }\n" #
+      "      .badge { display: inline-block; border: 1px solid #ffcc00; color: #ffcc00; padding: 6px 12px; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 0.08em; font-size: 14px; }\n" #
+      "      .muted { opacity: 0.75; font-size: 14px; }\n" #
+      "      .stats { margin-top: 18px; color: #d7fff0; }\n" #
+      "    </style>\n" #
+      "</head>\n" #
+      "<body>\n" #
+      "    <div class=\"panel\">\n" #
+      "      <div class=\"badge\">Paused</div>\n" #
+      "      <h1>TinyICP URL paused</h1>\n" #
+      "      <p>This short URL has used all of its prepaid clicks and is inactive until the owner tops it up.</p>\n" #
+      "      <p class=\"muted\">The owner can reactivate it at any time by purchasing more clicks in the TinyICP app.</p>\n" #
+      "      <div class=\"stats\">\n" #
+      "        <p><strong>Short URL:</strong> " # escapedShortUrl # "</p>\n" #
+      "        <p><strong>Total clicks served:</strong> " # Nat.toText(urlView.clicks) # "</p>\n" #
+      "        <p><strong>Remaining prepaid clicks:</strong> " # Nat.toText(urlView.allowance.remainingClicks) # "</p>\n" #
+      "      </div>\n" #
+      "    </div>\n" #
       "</body>\n" #
       "</html>";
     };

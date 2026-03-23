@@ -48,17 +48,34 @@ shared ({ caller = initializer }) persistent actor class Actor() = self {
     urls = BTree.init<Nat, UrlStore.Url>(null);
     nextId = 1;
   };
+  var urlBillingStableData : UrlStore.BillingStableData = {
+    allowances = BTree.init<Nat, UrlStore.UrlAllowance>(null);
+  };
+  var urlReservationStableData : UrlStore.ReservationStableData = {
+    reservations = BTree.init<Text, UrlStore.ShortCodeReservation>(null);
+  };
 
-  transient var urlStore = UrlStore.Store(urlStableData);
+  transient var urlStore = UrlStore.Store(
+    urlStableData,
+    urlBillingStableData,
+    urlReservationStableData,
+  );
   transient let canisterPrincipal = Principal.fromActor(self);
   transient var urlRouter = UrlRouter.Router(urlStore, Principal.toText(canisterPrincipal) # ".icp0.io");
+  transient let shortCodeReservationDurationNanos : Int = 10 * 60 * 1_000_000_000;
 
   system func preupgrade() {
     urlStableData := urlStore.toStableData();
+    urlBillingStableData := urlStore.toBillingStableData();
+    urlReservationStableData := urlStore.toReservationStableData();
   };
 
   system func postupgrade() {
-    urlStore := UrlStore.Store(urlStableData);
+    urlStore := UrlStore.Store(
+      urlStableData,
+      urlBillingStableData,
+      urlReservationStableData,
+    );
     urlRouter := UrlRouter.Router(urlStore, Principal.toText(canisterPrincipal) # ".icp0.io");
     routerConfig := buildRouterConfig();
     app := buildApp(routerConfig);
@@ -69,6 +86,36 @@ shared ({ caller = initializer }) persistent actor class Actor() = self {
     urlStore.getUrlsByOwner(caller);
   };
 
+  public query func get_public_url(shortCode : Text) : async ?UrlStore.UrlView {
+    switch (urlStore.getUrlByShortCode(shortCode)) {
+      case (?url) ?urlStore.toView(url);
+      case null null;
+    };
+  };
+
+  public shared query ({ caller }) func check_short_code_availability(shortCode : Text) : async Result.Result<Bool, Text> {
+    assertAuthenticated(caller);
+    urlStore.checkShortCodeAvailability(shortCode, ?caller);
+  };
+
+  public shared ({ caller }) func reserve_short_code_preview(shortCode : ?Text) : async Result.Result<Text, Text> {
+    assertAuthenticated(caller);
+    urlStore.reserveShortCode(caller, shortCode, shortCodeReservationDurationNanos);
+  };
+
+  public shared ({ caller }) func reserve_auto_short_code_preview() : async Result.Result<Text, Text> {
+    assertAuthenticated(caller);
+    urlStore.reserveShortCode(caller, null, shortCodeReservationDurationNanos);
+  };
+
+  public shared func record_short_link_visit(shortCode : Text) : async Result.Result<UrlStore.UrlView, Text> {
+    switch (urlStore.recordVisit(shortCode)) {
+      case (#ok(url)) #ok(urlStore.toView(url));
+      case (#inactive(_)) #err(UrlStore.allowanceExhaustedMessage);
+      case (#notFound) #err("Short URL not found");
+    };
+  };
+
   public shared ({ caller }) func get_wallet_info() : async IcpLedger.WalletInfo {
     assertAuthenticated(caller);
     await IcpLedger.getWalletInfo(canisterPrincipal, caller);
@@ -77,20 +124,53 @@ shared ({ caller = initializer }) persistent actor class Actor() = self {
   public shared ({ caller }) func create_my_url(request : UrlStore.CreateRequest) : async Result.Result<UrlStore.UrlView, Text> {
     assertAuthenticated(caller);
 
-    switch (urlStore.validateCreateRequest(request)) {
+    switch (urlStore.validateCreateRequestForCaller(request, caller)) {
       case (#err(message)) {
         return #err(message);
       };
       case (#ok(())) {};
     };
 
-    switch (await IcpLedger.chargeForUrl(canisterPrincipal, caller)) {
+    switch (urlStore.reserveShortCode(caller, request.customSlug, shortCodeReservationDurationNanos)) {
+      case (#err(message)) {
+        return #err(message);
+      };
+      case (#ok(_)) {};
+    };
+
+    switch (await IcpLedger.chargeForClicks(canisterPrincipal, caller, request.purchasedClicks)) {
       case (#err(message)) {
         #err("Payment required before Tiny ICP can create your short URL. " # message);
       };
       case (#ok(())) {
         let metadata = await fetchUrlMetadata(request.originalUrl);
         switch (urlStore.create(request, caller, metadata)) {
+          case (#ok(url)) #ok(urlStore.toView(url));
+          case (#err(message)) #err(message);
+        };
+      };
+    };
+  };
+
+  public shared ({ caller }) func top_up_my_url(
+    id : Nat,
+    purchasedClicks : Nat,
+  ) : async Result.Result<UrlStore.UrlView, Text> {
+    assertAuthenticated(caller);
+
+    switch (urlStore.validateTopUp(id, caller, purchasedClicks)) {
+      case (#err(message)) {
+        return #err(message);
+      };
+      case (#ok(())) {};
+    };
+
+    switch (await IcpLedger.chargeForClicks(canisterPrincipal, caller, purchasedClicks)) {
+      case (#err(message)) {
+        #err("Payment required before Tiny ICP can top up this URL. " # message);
+      };
+      case (#ok(())) {
+        switch (urlStore.topUp(id, caller, purchasedClicks)) {
           case (#ok(url)) #ok(urlStore.toView(url));
           case (#err(message)) #err(message);
         };
